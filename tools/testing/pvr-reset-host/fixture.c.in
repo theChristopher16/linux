@@ -1,0 +1,154 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* Synthetic callback traces only. No real PM, locking, firmware, IRQ or I/O. */
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+struct device { int unused; };
+struct drm_device { struct device *dev; };
+struct sysdata { unsigned hwr_state_flags; };
+struct pvr_device {
+    struct drm_device drm;
+    bool lost;
+    int reset_sem, irq;
+    struct { bool initialised; struct sysdata *fwif_sysdata; } fw_dev;
+};
+static char trace[1024];
+static int get_results[2], clear_result, get_count, refs, locks, irq_depth;
+static int disable_result[2], disable_count, hard_result, resume_result;
+static int enable_result[2], enable_count, suspend_result;
+static int warns, failures, cases;
+static void event(const char *name) {
+    if (strlen(trace) + strlen(name) + 2 >= sizeof(trace)) abort();
+    if (trace[0]) strcat(trace, ",");
+    strcat(trace, name);
+}
+static void check(bool ok, const char *name) {
+    if (!ok) { fprintf(stderr, "FAIL %s trace=%s refs=%d locks=%d irq=%d\n",
+                      name, trace, refs, locks, irq_depth); failures++; }
+}
+#define from_pvr_device(p) (&(p)->drm)
+#define WRITE_ONCE(x, y) ((x) = (y))
+#define ROGUE_FWIF_HWR_FW_FAULT 1u
+#define ROGUE_FWIF_HWR_RESTART_REQUESTED 2u
+#define drm_warn(...) ((void)0)
+#define drm_err(...) ((void)0)
+#define WARN_ON(x) do { if (x) warns++; } while (0)
+static int pvr_power_get(struct pvr_device *p) {
+    (void)p; event("get"); if (get_count >= 2) abort();
+    int result = get_results[get_count++]; if (!result) refs++; return result;
+}
+static int pvr_power_clear_error(struct pvr_device *p) {
+    (void)p; event("clear"); return clear_result;
+}
+static void pvr_power_put(struct pvr_device *p) { (void)p; event("put"); refs--; }
+static void down_write(int *lock) { (void)lock; event("lock"); locks++; }
+static void up_write(int *lock) { (void)lock; event("unlock"); locks--; }
+static void disable_irq(int irq) { (void)irq; event("irq_sync"); irq_depth++; }
+static void disable_irq_nosync(int irq) { (void)irq; event("irq_nosync"); irq_depth++; }
+static void enable_irq(int irq) { (void)irq; event("irq_enable"); irq_depth--; }
+static void pvr_queue_device_pre_reset(struct pvr_device *p) { (void)p; event("queue_pre"); }
+static void pvr_queue_device_post_reset(struct pvr_device *p) { (void)p; event("queue_post"); }
+static int pvr_power_fw_disable(struct pvr_device *p, bool hard, bool rpm) {
+    (void)p; (void)hard; (void)rpm; event("fw_disable");
+    if (disable_count >= 2) abort(); return disable_result[disable_count++];
+}
+static int pvr_power_device_suspend(struct device *p) { (void)p; event("suspend"); return suspend_result; }
+static int pvr_fw_hard_reset(struct pvr_device *p) { (void)p; event("fw_reset"); return hard_result; }
+static int pvr_power_device_resume(struct device *p) { (void)p; event("resume"); return resume_result; }
+static void pvr_fw_irq_clear(struct pvr_device *p) { (void)p; event("irq_clear"); }
+static int pvr_power_fw_enable(struct pvr_device *p, bool rpm) {
+    (void)p; (void)rpm; event("fw_enable");
+    if (enable_count >= 2) abort(); return enable_result[enable_count++];
+}
+static void pvr_device_lost(struct pvr_device *p) { event("lost"); p->lost = true; }
+
+@ACTUAL_FUNCTIONS@
+
+static struct device dev;
+static struct sysdata sys;
+static struct pvr_device gpu;
+static void fresh(void) {
+    memset(&gpu, 0, sizeof(gpu)); memset(&sys, 0, sizeof(sys));
+    trace[0] = 0; memset(get_results, 0, sizeof(get_results)); memset(disable_result, 0, sizeof(disable_result));
+    memset(enable_result, 0, sizeof(enable_result));
+    clear_result = get_count = refs = locks = irq_depth = 0;
+    disable_count = hard_result = resume_result = enable_count = suspend_result = warns = 0;
+    gpu.drm.dev = &dev; gpu.fw_dev.initialised = true; gpu.fw_dev.fwif_sysdata = &sys;
+    sys.hwr_state_flags = 7; cases++;
+}
+static const char *hard_tail = "lock,irq_sync,queue_pre,fw_disable,suspend,fw_reset,resume,irq_clear,fw_enable,queue_post,irq_enable,unlock,put";
+static const char *soft_tail = "lock,irq_nosync,fw_disable,irq_clear,fw_enable,irq_enable,unlock,put";
+static void trace_is(const char *prefix, const char *tail, const char *name) {
+    char expected[1024]; snprintf(expected, sizeof(expected), "%s%s%s", prefix, tail[0] ? "," : "", tail);
+    check(strcmp(expected, trace) == 0, name);
+}
+
+int main(void) {
+    /* Failed recovery paths must not reset or put an unacquired PM reference. */
+    for (int hard = 0; hard <= 1; hard++) {
+        for (int stage = 0; stage < 3; stage++) {
+            fresh(); get_results[0] = -EIO;
+            if (stage == 0) clear_result = -EBUSY;
+            else get_results[1] = stage == 1 ? -EIO : -ETIMEDOUT;
+            int expected = stage == 0 ? -EBUSY : get_results[1];
+            int rc = pvr_power_reset(&gpu, hard);
+            const char *prefix = stage == 0 ? "get,clear" : "get,clear,get";
+            if (CANDIDATE) {
+                check(rc == expected, "original PM error returned");
+                trace_is(prefix, "", "no reset callbacks after PM failure");
+                check(refs == 0 && locks == 0 && irq_depth == 0, "no unowned release");
+                check(gpu.fw_dev.initialised && !gpu.lost && sys.hwr_state_flags == 7,
+                      "no firmware or loss mutation");
+            } else {
+                check(rc == 0, "baseline continues after PM failure");
+                trace_is(prefix, hard ? hard_tail : soft_tail, "baseline callback sequence");
+                check(refs == -1 && warns == 1, "baseline unmatched PM put reproduced");
+            }
+        }
+    }
+    for (int hard = 0; hard <= 1; hard++) {
+        for (int recover = 0; recover <= 1; recover++) {
+            fresh(); if (recover) get_results[0] = -EIO;
+            check(pvr_power_reset(&gpu, hard) == 0, "successful reset");
+            trace_is(recover ? "get,clear,get" : "get", hard ? hard_tail : soft_tail, "success unchanged");
+            check(refs == 0 && locks == 0 && irq_depth == 0, "success balanced");
+        }
+    }
+    fresh(); gpu.lost = true;
+    check(pvr_power_reset(&gpu, true) == -EIO, "already lost");
+    trace_is("get", "lock,unlock,put", "already lost path");
+    check(refs == 0 && locks == 0, "already lost balanced");
+
+    fresh(); disable_result[0] = -ETIMEDOUT;
+    check(pvr_power_reset(&gpu, false) == 0, "soft falls back to hard");
+    trace_is("get", "lock,irq_nosync,fw_disable,queue_pre,fw_disable,suspend,fw_reset,resume,irq_clear,fw_enable,queue_post,irq_enable,unlock,put", "fallback trace");
+    check(refs == 0 && locks == 0 && irq_depth == 0, "fallback balanced");
+
+    /* Characterize existing later failures, not a proof of real recovery. */
+    for (int stage = 0; stage < 4; stage++) {
+        fresh();
+        if (stage == 0) disable_result[0] = -EIO;
+        if (stage == 1) hard_result = -EIO;
+        if (stage == 2) resume_result = -EIO;
+        if (stage == 3) enable_result[0] = -EIO;
+        check(pvr_power_reset(&gpu, true) == -EIO, "later error preserved");
+        const char *tails[] = {
+            "lock,irq_sync,queue_pre,fw_disable,lost,queue_post,unlock,put",
+            "lock,irq_sync,queue_pre,fw_disable,suspend,fw_reset,lost,queue_post,unlock,put",
+            "lock,irq_sync,queue_pre,fw_disable,suspend,fw_reset,resume,lost,queue_post,unlock,put",
+            "lock,irq_sync,queue_pre,fw_disable,suspend,fw_reset,resume,irq_clear,fw_enable,lost,queue_post,unlock,put"
+        };
+        trace_is("get", tails[stage], "later failure trace");
+        check(refs == 0 && locks == 0 && irq_depth == 1 && gpu.lost, "existing loss bookkeeping");
+    }
+    fresh(); suspend_result = -EIO;
+    check(pvr_power_reset(&gpu, true) == 0 && warns == 1, "unresolved suspend error still ignored");
+    trace_is("get", hard_tail, "unresolved suspend path unchanged");
+
+    if (failures) return 1;
+    printf("%s: %d synthetic reset scenarios passed\n", CANDIDATE ? "candidate" : "baseline characterization", cases);
+    return 0;
+}
